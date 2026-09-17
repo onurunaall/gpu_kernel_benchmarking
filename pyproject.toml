@@ -1,0 +1,34 @@
+[project]
+name = "gpu-kernel-bench"
+version = "0.1.0"
+description = "PyTorch vs Triton vs hand-written CUDA, with a measured roofline"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+    "triton>=3.0 ; sys_platform == 'linux'",
+]
+
+[project.scripts]
+kb = "bench.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bench", "ops"]
+
+# torch from PyPI is the CUDA 12.x build on linux, which is what I want on
+# the pod. On Windows the default PyPI wheel is CPU-only, so pin the index
+# there. Change cu124 to match whatever driver/toolkit the pod image has.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
+]
