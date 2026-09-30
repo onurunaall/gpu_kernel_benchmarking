@@ -22,6 +22,8 @@ import sys
 
 import torch
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
 METRICS = [
     "gpu__time_duration.sum",
     # roofline placement
@@ -30,7 +32,10 @@ METRICS = [
     # real DRAM traffic, to compare against the analytic byte count
     "dram__bytes_read.sum",
     "dram__bytes_write.sum",
-    # coalescing
+    # coalescing: % of each fetched 32-byte sector the kernel actually used.
+    # 100% = perfectly coalesced, whatever the access width.
+    "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct",
+    "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct",
     "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
     "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
     "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
@@ -97,12 +102,17 @@ def available_metrics():
 UNIT_SCALE = {
     "Kbyte": 1e3, "Mbyte": 1e6, "Gbyte": 1e9,
     "Kbyte/s": 1e3, "Mbyte/s": 1e6, "Gbyte/s": 1e9,
-    "usecond": 1e3, "msecond": 1e6,  # normalise durations to ns
+    "usecond": 1e3, "msecond": 1e6, "second": 1e9,  # normalise durations to ns
 }
 
 
 def parse_csv(text):
-    """ncu --csv -> {kernel name: {metric: value}}"""
+    """ncu --csv -> {"<launch id>: <kernel name>": {metric: value}}
+
+    Keyed by launch, not by name: eager torch can launch the same kernel
+    template twice (two multiplies), and keying by name would merge them and
+    undercount the launches.
+    """
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
@@ -115,10 +125,11 @@ def parse_csv(text):
     reader = csv.DictReader(io.StringIO("\n".join(lines[start:])))
     out = collections.defaultdict(dict)
     for row in reader:
-        kernel = (row.get("Kernel Name") or row.get("Kernel") or "").strip()
+        name = (row.get("Kernel Name") or row.get("Kernel") or "").strip()
         metric = (row.get("Metric Name") or "").strip()
-        if not kernel or not metric:
+        if not name or not metric:
             continue
+        kernel = "{}: {}".format((row.get("ID") or "?").strip(), name)
         try:
             value = float((row.get("Metric Value") or "").strip().replace(",", ""))
         except ValueError:
@@ -132,19 +143,27 @@ def derive(counters, analytic_bytes=None):
     """The three numbers that actually explain a result."""
     d = {}
 
+    # Sectors per request depends on access width: a coalesced warp moves 2
+    # sectors with 16-bit loads, 4 with 32-bit, 16 with 128-bit. So it's
+    # reported raw, and the width-independent "bytes used per sector" is
+    # the coalescing number (100% = every fetched byte was used).
     ld_s = counters.get("l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
     ld_r = counters.get("l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum")
     if ld_s and ld_r:
-        # 4 sectors/request is ideal for a coalesced 32-bit access, so
-        # normalise by 4: 1.0 is perfect, 2.0 means twice the traffic needed
         d["load_sectors_per_request"] = ld_s / ld_r
-        d["load_coalescing_factor"] = (ld_s / ld_r) / 4.0
+    ld_used = counters.get(
+        "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct")
+    if ld_used is not None:
+        d["load_sector_bytes_used_pct"] = ld_used
 
     st_s = counters.get("l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum")
     st_r = counters.get("l1tex__t_requests_pipe_lsu_mem_global_op_st.sum")
     if st_s and st_r:
         d["store_sectors_per_request"] = st_s / st_r
-        d["store_coalescing_factor"] = (st_s / st_r) / 4.0
+    st_used = counters.get(
+        "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct")
+    if st_used is not None:
+        d["store_sector_bytes_used_pct"] = st_used
 
     rd = counters.get("dram__bytes_read.sum")
     wr = counters.get("dram__bytes_write.sum")
@@ -169,19 +188,33 @@ def derive(counters, analytic_bytes=None):
     return d
 
 
+def child_command(op_name, dtype_key, impl_name, config_index):
+    """The command a profiler wraps: this module, running one call of one
+    impl between cudaProfilerStart/Stop. Also usable with Nsight Systems:
+
+        nsys profile --capture-range=cudaProfilerApi <this command>
+    """
+    return [
+        sys.executable, "-m", "bench.profiler", "--child",
+        "--op", op_name, "--dtype", dtype_key, "--impl", impl_name,
+        "--config-index", str(config_index),
+    ]
+
+
 def profile(op_name, dtype_key, impl_name, config_index, out_path=None):
     exe = shutil.which("ncu")
     if exe is None:
         raise RuntimeError("ncu not on PATH, this is tier B")
 
+    # --profile-from-start off: nothing is collected until the child calls
+    # cudaProfilerStart, so input generation and warmup launches stay out
+    # of the report and kernel_count is the launches of exactly one call
     cmd = [
         exe, "--csv", "--target-processes", "all",
+        "--profile-from-start", "off",
         "--metrics", ",".join(available_metrics()),
-        sys.executable, "-m", "bench.profiler", "--child",
-        "--op", op_name, "--dtype", dtype_key, "--impl", impl_name,
-        "--config-index", str(config_index),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    ] + child_command(op_name, dtype_key, impl_name, config_index)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if "ERR_NVGPUCTRPERM" in blob:
         raise RuntimeError(
@@ -217,7 +250,7 @@ def profile(op_name, dtype_key, impl_name, config_index, out_path=None):
         }
 
     if out_path is None:
-        out_dir = pathlib.Path(__file__).resolve().parent.parent / "results"
+        out_dir = ROOT / "results"
         out_dir.mkdir(exist_ok=True)
         out_path = out_dir / "ncu_{}_{}_{}_{}.json".format(
             op_name, dtype_key, impl_name,
@@ -241,15 +274,20 @@ def _child(args):
     inputs, _ = op.make_inputs(cfg, dtype, "cuda", gen)
     impl = op.impls(dtype)[args.impl]
 
-    # a few warm calls so JIT/autotune happens first. ncu profiles every
-    # launch including these, and averages per kernel name. Fine for
-    # counters, and another reason these never become timings.
     with torch.no_grad():
+        # warm calls first so JIT compile / autotune / cuBLAS heuristics are
+        # done before anything is recorded
         for _ in range(3):
             impl(*inputs)
         torch.cuda.synchronize()
-        impl(*inputs)
+
+        # the profiled region: exactly one call. The NVTX range labels it in
+        # an Nsight Systems timeline.
+        torch.cuda.profiler.start()
+        with torch.cuda.nvtx.range("{}/{}/{}".format(args.op, args.dtype, args.impl)):
+            impl(*inputs)
         torch.cuda.synchronize()
+        torch.cuda.profiler.stop()
 
 
 def main():

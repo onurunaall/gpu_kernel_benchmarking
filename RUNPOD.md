@@ -83,9 +83,12 @@ export PATH=/usr/local/cuda/bin:$PATH
 
 ```bash
 uv run kb bench --op vector_add --dtype fp16    # harness sanity check first
-uv run kb bench --op all --dtype fp16
+uv run python run_all.py --trace                # everything, plus kernel traces
 uv run kb profile --op rmsnorm --impl cuda --config-index 2
 ```
+
+`--trace` uses torch.profiler, which works on tier B. Add `--ncu` only if
+`kb env` reported tier A.
 
 `vector_add` is the self-test. All four implementations should land within a
 few percent of each other and near the measured copy roof. If they don't,

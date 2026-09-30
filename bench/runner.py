@@ -29,7 +29,7 @@ def _check(op, impl_fn, inputs, oracle_inputs):
         with torch.no_grad():
             got = impl_fn(*inputs)
             want = op.reference(oracle_inputs)
-        err = registry.max_rel_error(got, want)
+        err = op.error(got, want)
         del got, want
         return err, None
     except Exception:
@@ -49,6 +49,12 @@ def run_op(op_name, dtype_key, device="cuda", warmup=25, rep=100,
 
     gen = torch.Generator(device=device)
     gen.manual_seed(1234)
+
+    # Each op/dtype starts with an empty torch.compile cache. dynamo stops
+    # compiling after 8 variants of one function (torch._dynamo.config
+    # cache_size_limit) and silently runs eager from then on, which would
+    # make the "compile" column quietly measure eager on later sizes.
+    torch._dynamo.reset()
 
     impls = op.impls(dtype)
     if impl_filter:
@@ -110,8 +116,11 @@ def run_op(op_name, dtype_key, device="cuda", warmup=25, rep=100,
                     continue
 
             try:
-                t = timing.benchmark(functools.partial(impl_fn, *inputs),
-                                     device, warmup=warmup, rep=rep)
+                # no_grad here as well as in the check: grad mode is part of
+                # torch.compile's guards, so switching it forces a recompile
+                with torch.no_grad():
+                    t = timing.benchmark(functools.partial(impl_fn, *inputs),
+                                         device, warmup=warmup, rep=rep)
             except Exception:
                 rec["status"] = "exception"
                 rec["error"] = traceback.format_exc(limit=6)

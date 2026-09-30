@@ -7,7 +7,11 @@ import torch
 
 import ops  # noqa: F401  importing this registers every op
 
-from . import env, plots, profiler, registry, roofline, runner
+from . import env, kernel_trace, plots, profiler, registry, roofline, runner
+
+# commands that only read JSON or list ops, so they work on a laptop without
+# a GPU after copying results/ over
+NO_GPU_NEEDED = {"env", "list", "plot"}
 
 
 def cmd_env(args):
@@ -36,14 +40,15 @@ def cmd_bench(args):
         impl_filter=args.impl or None, probe_profiler=not args.no_probe,
     )
     if not args.no_plot:
-        for path in plots.render(paths):
+        for path in plots.render(paths) + plots.render_overview(plots.all_results()):
             print("-> {}".format(path))
 
 
 def cmd_profile(args):
     result, path = profiler.profile(args.op, args.dtype, args.impl,
                                     args.config_index)
-    interesting = ("load_sectors_per_request", "store_sectors_per_request",
+    interesting = ("load_sector_bytes_used_pct", "store_sector_bytes_used_pct",
+                   "load_sectors_per_request", "store_sectors_per_request",
                    "measured_dram_bytes", "traffic_ratio",
                    "dominant_stall", "dominant_stall_meaning")
     for kernel, data in result["kernels"].items():
@@ -58,12 +63,28 @@ def cmd_profile(args):
     print("-> {}".format(path))
 
 
+def cmd_trace(args):
+    op = registry.get(args.op)
+    impl_names = args.impl or sorted(op.impls(runner.DTYPES[args.dtype]))
+    paths = []
+    for impl in impl_names:
+        summary, path = kernel_trace.trace(args.op, args.dtype, impl,
+                                           args.config_index, calls=args.calls)
+        kernel_trace.print_summary(summary)
+        paths.append(path)
+    for path in plots.render_traces(paths):
+        print("-> {}".format(path))
+
+
 def cmd_plot(args):
     paths = args.result or plots.all_results()
-    if not paths:
+    traces = kernel_trace.all_traces()
+    if not paths and not traces:
         print("nothing in results/")
         return
-    for path in plots.render(paths):
+    written = plots.render(paths) + plots.render_overview(paths)
+    written += plots.render_traces(traces)
+    for path in written:
         print("-> {}".format(path))
 
 
@@ -110,6 +131,14 @@ def build_parser():
     p.add_argument("--config-index", type=int, default=0)
     p.set_defaults(func=cmd_profile)
 
+    p = sub.add_parser("trace", help="torch.profiler kernel trace, no special permissions")
+    p.add_argument("--op", required=True)
+    p.add_argument("--dtype", default="fp16", choices=sorted(runner.DTYPES))
+    p.add_argument("--impl", action="append", help="default: every impl")
+    p.add_argument("--config-index", type=int, default=0)
+    p.add_argument("--calls", type=int, default=10)
+    p.set_defaults(func=cmd_trace)
+
     p = sub.add_parser("plot", help="regenerate figures from results/")
     p.add_argument("--result", action="append")
     p.set_defaults(func=cmd_plot)
@@ -126,7 +155,7 @@ def main():
         args.dtype = ["fp16"]
     if args.command == "bench" and not args.op:
         args.op = ["all"]
-    if args.command != "env" and not torch.cuda.is_available():
+    if args.command not in NO_GPU_NEEDED and not torch.cuda.is_available():
         raise SystemExit("no CUDA device visible")
     args.func(args)
 

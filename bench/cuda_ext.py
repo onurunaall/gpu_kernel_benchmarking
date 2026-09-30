@@ -40,7 +40,10 @@ def load_kernel(name, sources):
     if name in _LOADED:
         return _LOADED[name]
 
-    BUILD.mkdir(exist_ok=True)
+    # one build directory per extension: torch writes a build.ninja into it,
+    # and two extensions sharing a directory overwrite each other's file
+    build_dir = BUILD / name
+    build_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for src in sources:
         p = KERNELS / src
@@ -53,7 +56,7 @@ def load_kernel(name, sources):
         sources=paths,
         extra_cflags=["-O3"],
         extra_cuda_cflags=cuda_flags(),
-        build_directory=str(BUILD),
+        build_directory=str(build_dir),
         verbose=os.environ.get("KB_VERBOSE_BUILD", "0") == "1",
     )
     return _LOADED[name]
