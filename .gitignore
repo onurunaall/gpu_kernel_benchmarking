@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 *.ncu-rep
+*.nsys-rep
 results/*.json
 figures/*.png
 figures/*.md

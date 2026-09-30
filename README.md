@@ -3,10 +3,56 @@
 PyTorch vs Triton vs hand-written CUDA, one kernel at a time, with the
 methodology written down.
 
+Every kernel exists four times, all checked against the same fp64 oracle
+and timed by the same harness on the same GPU:
+
+| impl | what it is |
+|---|---|
+| `eager` | plain PyTorch, what you'd write without thinking about kernels |
+| `compile` | `torch.compile` of the eager code (generates Triton kernels, hands matmul to cuBLAS) |
+| `triton` | a hand-written Triton kernel |
+| `cuda` | a hand-written CUDA C++ kernel, JIT-built with `cpp_extension` |
+
+| op | regime | what it exercises |
+|---|---|---|
+| `vector_add` | memory-bound | calibration: should sit at the copy roof |
+| `reduce_sum` | memory-bound | full reduction, combining partial sums across blocks |
+| `transpose` | memory-bound | access patterns only, zero FLOPs, shared-memory tiling |
+| `softmax` | memory-bound | two row reductions (max, sum), numerical stability |
+| `rmsnorm` | memory-bound | the fusion win over a chain of eager ops |
+| `matmul` | compute-bound | tiling, register blocking, tensor cores |
+
 The three-way comparison isn't the interesting part. Plenty of repos plot
 three bars. What I care about is the layer under it: a roofline measured on
 the actual device, an fp64 correctness oracle, and Nsight counters that
 explain *why* each version lands where it does.
+
+---
+
+## Quick start
+
+```bash
+python run_all.py                     # every op, fp16: correctness, timing, figures
+python run_all.py --trace             # + which kernels each impl launches
+python run_all.py --ncu               # + Nsight Compute counters (tier A only)
+python run_all.py --ops softmax matmul --dtypes fp16 fp32
+python run_all.py --help
+```
+
+`run_all.py` is the control script: it runs the machine check, the
+benchmark sweep, the optional profilers and the figures, in that order. The
+`kb` CLI below does the same steps one at a time.
+
+## Layout
+
+```
+run_all.py        control script, runs everything
+bench/            the harness: timing, roofline, oracle checks, profilers, plots
+ops/              one file per kernel: eager, compile and triton impls + sizes
+kernels/          the CUDA source for each op
+results/          JSON output (git-ignored unless force-added)
+figures/          PNG + markdown tables, regenerated from results/
+```
 
 ---
 
@@ -69,9 +115,42 @@ kernel sees and input rounding doesn't get mixed into kernel error. Both
 PyTorch and my kernel get scored against it. Sometimes mine wins, which is a
 more interesting line than any speedup.
 
+The error is element-wise relative error, with the denominator floored at
+the dtype's smallest normal number. Without the floor, fp16 outputs that land
+in the subnormal range (|y| < 6e-5, a handful of elements in each RMSNorm
+config) score 10%+ "relative error" for every implementation, eager included,
+just from storing the result. Matmul uses max |error| / max |output| instead:
+its outputs are sums of signed products, some cancel to near zero, and
+element-wise relative error on those says nothing about the kernel.
+
 ---
 
-## Profiling tiers
+## Profiling
+
+Three profilers, from least to most demanding:
+
+| tool | answers | needs | command |
+|---|---|---|---|
+| `torch.profiler` | which kernels does one call launch, how long does each run | nothing | `kb trace` / `run_all.py --trace` |
+| Nsight Systems | timeline: launches, gaps between kernels, CPU overhead | `nsys` installed | see below |
+| Nsight Compute | *why*: DRAM traffic, coalescing, occupancy, stalls | counter permission (tier A) | `kb profile` / `run_all.py --ncu` |
+
+`kb trace` writes a summary JSON and a Chrome trace to `results/`. Open the
+`.chrome.json` at https://ui.perfetto.dev to see the timeline. It's the one
+to reach for on RunPod, where counters are usually blocked: it still shows
+that eager RMSNorm is a chain of separate kernels and the fused versions
+are one.
+
+For an Nsight Systems timeline of one call, wrap the same child process
+`kb profile` uses. It calls `cudaProfilerStart/Stop` around exactly one call
+after warmup, and labels it with an NVTX range:
+
+```bash
+nsys profile --capture-range=cudaProfilerApi --trace=cuda,nvtx -o results/rmsnorm_eager \
+    python -m bench.profiler --child --op rmsnorm --dtype fp16 --impl eager --config-index 3
+```
+
+### Counter tiers
 
 Hardware counters need elevated permission (driver 418+). The harness detects
 which tier it's in and records it in every result file.
@@ -92,7 +171,9 @@ card. Use a GPU Pod. See `RUNPOD.md`.
 
 Counters and timings always come from separate runs. `ncu` serialises
 launches and replays each kernel many times, so its durations are not
-benchmark numbers.
+benchmark numbers. `ncu` runs with `--profile-from-start off`, so input
+generation and warmup launches stay out of the report and the kernel count
+is the launches of exactly one call.
 
 ### What gets collected
 
@@ -100,8 +181,11 @@ benchmark numbers.
 list in `bench/profiler.py` is the minimum that explains a result, and three
 derived numbers do the actual explaining:
 
-* **sectors per request**: 4 is ideal for a coalesced 32-bit access, higher
-  means wasted DRAM traffic.
+* **sector bytes used %**: how much of each fetched 32-byte sector the kernel
+  actually used. 100% is perfectly coalesced. Raw sectors per request is
+  reported too, but its ideal value depends on access width (2 for coalesced
+  16-bit loads, 4 for 32-bit, 16 for 128-bit), so on its own it can't tell
+  a vectorized kernel from an uncoalesced one.
 * **traffic ratio**: measured `dram__bytes_*` over the analytic minimum.
   Above 1 means re-reading something. Below 1 means a cache is absorbing
   traffic, which on a 72 MB L2 part is normal and is itself a finding.
@@ -152,12 +236,26 @@ uv run kb roofline --dtype fp16                  # just the roofs
 uv run kb bench --op vector_add --dtype fp16     # sweep one op
 uv run kb bench --op all --dtype fp16 --dtype fp32
 uv run kb profile --op rmsnorm --impl cuda --config-index 2
+uv run kb trace --op rmsnorm --config-index 3    # torch.profiler, every impl
 uv run kb plot                                   # regenerate figures
 ```
 
 Results go to `results/*.json`, figures to `figures/`. Plots always
 regenerate from the JSON, so re-running on a different GPU in six months
-needs no code changes.
+needs no code changes. `kb plot` and `kb list` don't need a GPU, so results
+copied back to a laptop can be plotted there.
+
+### Figures
+
+| file | shows |
+|---|---|
+| `*_latency.png` | median latency per size, log scale |
+| `*_speedup.png` | speedup over PyTorch eager per size |
+| `*_roof.png` | % of the measured bandwidth or compute roof, whichever applies |
+| `*_roofline.png` | every measurement on the measured roofline (skipped for transpose, which has no FLOPs) |
+| `*_table.md` | the numbers behind all of the above, including error vs the oracle |
+| `overview_<gpu>_<dtype>.png` | one heatmap: geomean speedup over eager, every op x impl |
+| `kernels_<op>_<dtype>_<size>.png` | from `kb trace`: kernel launches and GPU time per call, per impl |
 
 Windows results are never merged into a linux chart. WDDM batches kernel
 submissions and adds launch overhead linux doesn't have, and at small sizes
@@ -171,7 +269,10 @@ per run.
 1. Write `kernels/<name>.cu`.
 2. Write `ops/<name>.py`: subclass `registry.Op`, decorate with
    `@registry.register`, fill in `configs`, `make_inputs`, `reference`,
-   `flops`, `bytes`, `impls`.
+   `flops`, `bytes`, `impls`. Override `error` if element-wise relative
+   error is the wrong measure (see `ops/matmul.py`). Keep `configs` at 8
+   sizes or fewer: `torch.compile` stops recompiling after 8 shapes of one
+   function and silently runs eager after that.
 3. One import line in `ops/__init__.py`.
 4. `uv run kb bench --op <name> --dtype fp16`
 5. `uv run kb profile --op <name> --impl cuda --config-index 2`
@@ -186,16 +287,16 @@ because the win comes from removing DRAM round trips and launches rather than
 out-computing NVIDIA.
 
 - [x] vector add (calibrates the harness against the bandwidth roof)
-- [ ] sum reduction (warp shuffles, atomics vs two-pass)
-- [ ] transpose (coalescing, shared memory bank conflicts)
-- [ ] softmax (online single pass, numerical stability)
+- [x] sum reduction (warp shuffles, one atomic per block)
+- [x] transpose (coalescing, shared memory bank conflicts)
+- [x] softmax (online max/sum, numerical stability)
 - [x] RMSNorm forward (the fusion win)
 
 **Phase 2, compute-bound.** Expect to lose to cuBLAS. Tracking "% of cuBLAS"
 across versions, not framing it as a contest.
 
 - [ ] naive GEMM (the baseline to beat by 20x)
-- [ ] tiled GEMM with shared memory
+- [x] tiled GEMM with shared memory + register blocking
 - [ ] register blocking + 128-bit loads
 - [ ] tensor core GEMM via `wmma` / `mma` PTX
 
