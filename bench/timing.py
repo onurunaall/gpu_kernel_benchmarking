@@ -37,24 +37,26 @@ def benchmark(fn, device, warmup=25, rep=100, flush_l2=True):
     Median not mean. Scheduler noise is one-sided, so the mean drifts upward
     for reasons that say nothing about the kernel.
     """
-    torch.cuda.set_device(device)
-    flush = flush_buffer(device) if flush_l2 else None
+    # torch.cuda.device accepts plain "cuda"; torch.cuda.set_device("cuda")
+    # raises because the string carries no device index
+    with torch.cuda.device(device):
+        flush = flush_buffer(device) if flush_l2 else None
 
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize(device)
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize(device)
 
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
 
-    for i in range(rep):
-        if flush is not None:
-            flush.zero_()
-        starts[i].record()
-        fn()
-        ends[i].record()
+        for i in range(rep):
+            if flush is not None:
+                flush.zero_()
+            starts[i].record()
+            fn()
+            ends[i].record()
 
-    torch.cuda.synchronize(device)
+        torch.cuda.synchronize(device)
 
     times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
 
